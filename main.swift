@@ -249,6 +249,9 @@ private typealias MTCallback = @convention(c) (UnsafeMutableRawPointer?, UnsafeM
 private typealias MTListFn = @convention(c) () -> Unmanaged<CFArray>
 private typealias MTRegisterFn = @convention(c) (UnsafeMutableRawPointer, MTCallback) -> Void
 private typealias MTStartFn = @convention(c) (UnsafeMutableRawPointer, Int32) -> Int32
+private typealias MTStopFn = @convention(c) (UnsafeMutableRawPointer) -> Int32
+private typealias MTUnregisterFn = @convention(c) (UnsafeMutableRawPointer, MTCallback) -> Void
+private let mtPath = "/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport"
 
 private let mtCallback: MTCallback = { _, touches, count, _, _ in
     TouchEngine.shared.handleRaw(touches, Int(count))
@@ -270,8 +273,7 @@ final class TouchEngine {
 
     @discardableResult
     func start() -> Bool {
-        let path = "/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport"
-        guard let h = dlopen(path, RTLD_NOW),
+        guard let h = dlopen(mtPath, RTLD_NOW),
               let l = dlsym(h, "MTDeviceCreateList"),
               let r = dlsym(h, "MTRegisterContactFrameCallback"),
               let s = dlsym(h, "MTDeviceStart") else { return false }
@@ -286,6 +288,31 @@ final class TouchEngine {
             _ = startFn(dev, 0)
         }
         return arr.count > 0
+    }
+
+    /// Detach from all trackpads (used before re-attaching after sleep/wake).
+    func stop() {
+        if let arr = devices,
+           let h = dlopen(mtPath, RTLD_NOW),
+           let u = dlsym(h, "MTUnregisterContactFrameCallback"),
+           let st = dlsym(h, "MTDeviceStop") {
+            let unreg = unsafeBitCast(u, to: MTUnregisterFn.self)
+            let stopFn = unsafeBitCast(st, to: MTStopFn.self)
+            for i in 0..<arr.count {
+                let dev = Unmanaged.passUnretained(arr[i] as AnyObject).toOpaque()
+                unreg(dev, mtCallback)
+                _ = stopFn(dev)
+            }
+        }
+        devices = nil
+        finish()
+        blocked = false
+    }
+
+    @discardableResult
+    func restart() -> Bool {
+        stop()
+        return start()
     }
 
     // Called on a background multitouch thread
@@ -408,18 +435,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let st = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
         st.target = self
         menu.addItem(st)
+        let rs = NSMenuItem(title: "Restart Trackpad Engine", action: #selector(restartEngine), keyEquivalent: "")
+        rs.target = self
+        menu.addItem(rs)
         menu.addItem(.separator())
         let q = NSMenuItem(title: "Quit EdgeSlide", action: #selector(quit), keyEquivalent: "q")
         q.target = self
         menu.addItem(q)
         statusItem.menu = menu
 
-        if !TouchEngine.shared.start() {
-            let a = NSAlert()
-            a.messageText = "Trackpad not found"
-            a.informativeText = "Could not start MultitouchSupport. If it does not work, allow EdgeSlide in System Settings → Privacy & Security → Input Monitoring, then reopen the app."
-            a.runModal()
+        // Start the trackpad engine; at login the trackpad may not be ready yet, so keep retrying quietly.
+        if !TouchEngine.shared.start() { retryStart() }
+
+        // At login the trackpad can look connected but deliver no touches yet.
+        // Re-attach a few times shortly after launch so it works without a manual quit/reopen.
+        for delay in [3.0, 10.0, 30.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                if !TouchEngine.shared.restart() { self?.retryStart() }
+            }
         }
+
+        // After sleep / wake / unlock the trackpad connection can go stale: re-attach.
+        let nc = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.didWakeNotification,
+                     NSWorkspace.screensDidWakeNotification,
+                     NSWorkspace.sessionDidBecomeActiveNotification] {
+            nc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.restartEngineSoon()
+            }
+        }
+    }
+
+    private var retryTimer: Timer?
+
+    private func retryStart() {
+        retryTimer?.invalidate()
+        retryTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] t in
+            if TouchEngine.shared.start() { t.invalidate(); self?.retryTimer = nil }
+        }
+    }
+
+    private func restartEngineSoon() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            if !TouchEngine.shared.restart() { self?.retryStart() }
+        }
+    }
+
+    @objc func restartEngine() {
+        if !TouchEngine.shared.restart() { retryStart() }
     }
 
     @objc func toggleEnabled() {
